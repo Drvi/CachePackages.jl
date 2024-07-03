@@ -4,8 +4,10 @@ using Pkg, TOML, UUIDs, Dates
 
 const CACHE_PACKAGES_PATH = Ref{String}()
 const CACHE_PACKAGES_PATH_LOCK = ReentrantLock()
+
 function __init__()
-    global CACHE_PACKAGES_PATH[] = tempdir()
+    path = mkpath(joinpath(first(Base.DEPOT_PATH), "cache_packages"))
+    set_cache_package_path_and_add_it_to_load_path!(path)
 end
 
 export set_cache_package_path_and_add_it_to_load_path!, make_pkgimage_cache, load_all_caches, drop_all_caches
