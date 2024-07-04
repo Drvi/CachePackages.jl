@@ -4,6 +4,7 @@ using Pkg, TOML, UUIDs, Dates
 
 const CACHE_PACKAGES_PATH = Ref{String}()
 const CACHE_PACKAGES_PATH_LOCK = ReentrantLock()
+const CACHE_PACKAGE_NAME_PREFIX = "Cache"
 
 function __init__()
     path = mkpath(joinpath(first(Base.DEPOT_PATH), "cache_packages"))
@@ -21,8 +22,16 @@ end
 
 _now() = Dates.format(Dates.now(), "yyyymmddHHMMSSsss")
 
-function make_pkgimage_cache(precompiles_path, suffix=_now(); dedupe=true, project=Base.active_project(), cache_load_path=CACHE_PACKAGES_PATH[])
-    cache_pkg_name = string("Cache", string(suffix))
+function make_pkgimage_cache(
+    precompiles_path::Union{Nothing,AbstractString}=nothing, suffix=_now();
+    dedupe=true, project=Base.active_project(), cache_load_path=CACHE_PACKAGES_PATH[]
+)
+    if isnothing(precompiles_path)
+        trace_compile_ptr = Base.JLOptions().trace_compile
+        trace_compile_ptr == C_NULL && ArgumentError("No `precompiles_path` provided and `--trace-compile` is not set")
+        precompiles_path = unsafe_string(trace_compile_ptr)
+    end
+    cache_pkg_name = string(CACHE_PACKAGE_NAME_PREFIX, string(suffix))
 
     isdir(cache_load_path) || error("Cache directory `$cache_load_path` does not exist")
     isfile(precompiles_path) || error("Precompiles file cannot be found at path `$precompiles_path`")
@@ -33,16 +42,20 @@ function make_pkgimage_cache(precompiles_path, suffix=_now(); dedupe=true, proje
     if dedupe
         for other_cache_pkg_name in readdir(cache_load_path, join=true)
             isdir(other_cache_pkg_name) || continue
-            startswith("Cache", basename(other_cache_pkg_name)) || continue
+            startswith(CACHE_PACKAGE_NAME_PREFIX, basename(other_cache_pkg_name)) || continue
             for other_precompile in eachline(joinpath(other_cache_pkg_name, "src", "precompiles.jl"))
                 delete!(precompiles, other_precompile)
             end
+            if isempty(precompiles)
+                @info "No new precompiles to add to cache at `$cache_load_path`, skipping cache package creation for suffix `$suffix`"
+                return
+            end
         end
-    end
-
-    if isempty(precompiles)
-        @info "No new precompiles to add to cache at `$cache_load_path`, skipping cache package creation for suffix `$suffix`"
-        return
+    else
+        if isempty(precompiles)
+            @info "No new precompiles to add to cache at `$cache_load_path`, skipping cache package creation for suffix `$suffix`"
+            return
+        end
     end
 
     generate_cache_pkg(cache_load_path, cache_pkg_name, project, precompiles)
@@ -55,7 +68,7 @@ function generate_cache_pkg(cache_load_path, cache_pkg_name, project, precompile
     try
         open(joinpath(cache_load_path, cache_pkg_name, "src", string(cache_pkg_name, ".jl")), "w") do io
             println(io, "module ", cache_pkg_name)
-            println(io, "# Automatically generated at ", Dates.now())
+            println(io, "# Automatically generated on ", Dates.now())
             println(io, "# You shouldn't need to edit these files manually")
             println(io)
             println(io, "# Loading the dependencies of the original project that generated the `precompiles.jl` file")
@@ -80,7 +93,12 @@ function generate_cache_pkg(cache_load_path, cache_pkg_name, project, precompile
                     esc(try
                         \$expr;
                     catch e;
-                        @debug "Precompilation failed for `\$(\$(string(expr)))`" exception=e _file=\"$(joinpath(cache_load_path, cache_pkg_name))\" _line=nothing _module=$cache_pkg_name;
+                        @debug("Precompilation failed for `\$(\$(string(expr)))`",
+                            exception=e,
+                            _file=\"$(joinpath(cache_load_path, cache_pkg_name, "src", "precompiles.jl"))\",
+                            _line=nothing,
+                            _module=$cache_pkg_name,
+                        )
                         return nothing;
                     end)
                 end
@@ -111,7 +129,7 @@ function generate_cache_pkg(cache_load_path, cache_pkg_name, project, precompile
             end
         end
     catch
-        rm(joinpath(cache_load_path, cache_pkg_name), recursive=true)
+        rm(joinpath(cache_load_path, cache_pkg_name), recursive=true, force=true)
         rethrow()
     end
 end
@@ -121,7 +139,6 @@ function load_all_caches(mod, cache_load_path=CACHE_PACKAGES_PATH[])
     cache_load_path in LOAD_PATH || error("Cache directory `$cache_load_path` is not in LOAD_PATH")
 
     # TODO: precompile cache packages in parallel
-    # mod = Module()
     for cache_pkg_name in readdir(cache_load_path)
         if isdir(joinpath(cache_load_path, cache_pkg_name))
             try
@@ -138,7 +155,8 @@ end
 function drop_all_caches(cache_load_path=CACHE_PACKAGES_PATH[]; force=false)
     isdir(cache_load_path) || error("Cache directory `$cache_load_path` does not exist")
     if !force
-        any(f->isdir(f) && !startswith("Cache"), readdir(cache_load_path)) && error("Cache directory `$cache_load_path` contains non-cache packages, won't delete anything")
+        any(f->isdir(f) && !startswith(CACHE_PACKAGE_NAME_PREFIX), readdir(cache_load_path)) &&
+            error("Cache directory `$cache_load_path` contains non-cache packages, won't delete anything")
     end
     for cache_pkg_path in readdir(cache_load_path, join=true)
         isdir(cache_pkg_path) && rm(cache_pkg_path, recursive=true, force=true)
