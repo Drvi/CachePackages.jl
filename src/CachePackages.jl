@@ -15,12 +15,19 @@ export set_cache_package_path_and_add_it_to_load_path!, make_pkgimage_cache, loa
 
 function set_cache_package_path_and_add_it_to_load_path!(path)
     @lock CACHE_PACKAGES_PATH_LOCK begin
-        CACHE_PACKAGES_PATH[] = path
-        path in LOAD_PATH || push!(LOAD_PATH, path) # Split this into two methods?
+        if isassigned(CACHE_PACKAGES_PATH)
+            i = findall(isequal(CACHE_PACKAGES_PATH[]), LOAD_PATH)
+            isempty(i) || splice!(LOAD_PATH, i)
+        end
+        apath = abspath(path)
+        CACHE_PACKAGES_PATH[] = apath
+        apath in LOAD_PATH || push!(LOAD_PATH, apath) # Split this into two methods?
     end
+    return nothing
 end
 
 _now() = Dates.format(Dates.now(), "yyyymmddHHMMSSsss")
+_is_cache_pkg_path(path) = isdir(path) && startswith(basename(path), CACHE_PACKAGE_NAME_PREFIX)
 
 function make_pkgimage_cache(
     precompiles_path::Union{Nothing,AbstractString}=nothing, suffix=_now();
@@ -58,13 +65,15 @@ function make_pkgimage_cache(
         end
     end
 
-    generate_cache_pkg(cache_load_path, cache_pkg_name, project, precompiles)
+    return generate_cache_pkg(cache_load_path, cache_pkg_name, project, precompiles)
 end
 
+_parse_deps(io) = sort!(collect(Pkg.TOML.parse(io)["deps"]))
 function generate_cache_pkg(cache_load_path, cache_pkg_name, project, precompiles)
-    deps = open(io->sort!(collect(Pkg.TOML.parse(io)["deps"])), project)
+    deps = open(_parse_deps, project)
 
     mkpath(joinpath(cache_load_path, cache_pkg_name, "src"))
+    local uuid
     try
         open(joinpath(cache_load_path, cache_pkg_name, "src", string(cache_pkg_name, ".jl")), "w") do io
             println(io, "module ", cache_pkg_name)
@@ -132,22 +141,32 @@ function generate_cache_pkg(cache_load_path, cache_pkg_name, project, precompile
         rm(joinpath(cache_load_path, cache_pkg_name), recursive=true, force=true)
         rethrow()
     end
+    return Base.PkgId(uuid, cache_pkg_name)
 end
 
-function load_all_caches(mod, cache_load_path=CACHE_PACKAGES_PATH[])
+_parse_pkgid(io) = (toml = Pkg.TOML.parse(io); Base.PkgId(UUID(toml["uuid"]), toml["name"]))
+function load_all_caches(mod=Module(), cache_load_path=CACHE_PACKAGES_PATH[], project = Base.active_project())
     isdir(cache_load_path) || error("Cache directory `$cache_load_path` does not exist")
     cache_load_path in LOAD_PATH || error("Cache directory `$cache_load_path` is not in LOAD_PATH")
 
-    # TODO: precompile cache packages in parallel
+    try
+        @sync for cache_pkg_path in readdir(cache_load_path, join=true)
+            _is_cache_pkg_path(cache_pkg_path) || continue
+            pkgid = open(_parse_pkgid, joinpath(cache_pkg_path, "Project.toml"))
+            !Base.isprecompiled(pkgid) && (Threads.@spawn Base.compilecache(pkgid))
+        end
+    catch ex
+        @warn "Parallel precompilation failed. Compilation will be attempted at load time, serially." exception=ex
+    end
+
     for cache_pkg_name in readdir(cache_load_path)
-        if isdir(joinpath(cache_load_path, cache_pkg_name))
-            try
-                Base.require(mod, Symbol(cache_pkg_name))
-            catch ex
-                # TODO: the source location could be improved
-                bt = catch_backtrace()
-                @warn "Failed to load cache package `$(cache_pkg_name)`" exception=(ex,bt) _file=joinpath(cache_load_path, cache_pkg_name) _module=cache_pkg_name _line=1
-            end
+        _is_cache_pkg_path(joinpath(cache_load_path, cache_pkg_name)) || continue
+        try
+            Base.require(mod, Symbol(cache_pkg_name))
+        catch ex
+            # TODO: the source location could be improved
+            bt = catch_backtrace()
+            @warn "Failed to load cache package `$(cache_pkg_name)`" exception=(ex,bt) _file=joinpath(cache_load_path, cache_pkg_name) _module=cache_pkg_name _line=1
         end
     end
 end
