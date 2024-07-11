@@ -2,37 +2,55 @@ module CachePackages
 
 using Pkg, TOML, UUIDs, Dates
 
-const CACHE_PACKAGES_PATH = Ref{String}()
-const CACHE_PACKAGES_PATH_LOCK = ReentrantLock()
+const CACHE_PACKAGES_LOAD_PATH = Ref{String}()
+const CACHE_PACKAGES_DEPOT_PATH = Ref{String}()
+const MAX_CONCURRENT_PRECOMPILES = Ref{Int}()
+const CACHE_PACKAGES_LOAD_PATH_LOCK = ReentrantLock()
 const CACHE_PACKAGE_NAME_PREFIX = "Cache"
 
 function __init__()
     path = mkpath(joinpath(first(Base.DEPOT_PATH), "cache_packages"))
     set_cache_package_path_and_add_it_to_load_path!(path)
+    CACHE_PACKAGES_DEPOT_PATH[] = DEPOT_PATH[1] # TODO: fully support separate depots
+    MAX_CONCURRENT_PRECOMPILES[] = 1 #Threads.nthreads(:default)
 end
 
-export set_cache_package_path_and_add_it_to_load_path!, make_pkgimage_cache, load_all_caches, drop_all_caches
+export set_cache_package_path_and_add_it_to_load_path!, make_pkgimage_cache, precompile_all_caches, load_all_caches, drop_all_caches, list_all_caches
 
 function set_cache_package_path_and_add_it_to_load_path!(path)
-    @lock CACHE_PACKAGES_PATH_LOCK begin
-        if isassigned(CACHE_PACKAGES_PATH)
-            i = findall(isequal(CACHE_PACKAGES_PATH[]), LOAD_PATH)
+    @lock CACHE_PACKAGES_LOAD_PATH_LOCK begin
+        if isassigned(CACHE_PACKAGES_LOAD_PATH)
+            i = findall(isequal(CACHE_PACKAGES_LOAD_PATH[]), LOAD_PATH)
             isempty(i) || splice!(LOAD_PATH, i)
         end
         apath = abspath(path)
-        CACHE_PACKAGES_PATH[] = apath
+        CACHE_PACKAGES_LOAD_PATH[] = apath
         apath in LOAD_PATH || push!(LOAD_PATH, apath) # Split this into two methods?
     end
     return nothing
+end
+
+function list_all_caches(cache_load_path=CACHE_PACKAGES_LOAD_PATH[]; join=false)
+    if join
+        return filter!(_is_cache_pkg_path, readdir(cache_load_path, join=true))
+    else
+        return filter!(p->startswith(p, CACHE_PACKAGE_NAME_PREFIX), readdir(cache_load_path, join=false))
+    end
 end
 
 _now() = Dates.format(Dates.now(), "yyyymmddHHMMSSsss")
 _is_cache_pkg_path(path) = isdir(path) && startswith(basename(path), CACHE_PACKAGE_NAME_PREFIX)
 
 function make_pkgimage_cache(
-    precompiles_path::Union{Nothing,AbstractString}=nothing, suffix=_now();
-    dedupe=true, project=Base.active_project(), cache_load_path=CACHE_PACKAGES_PATH[]
+    precompiles_path::Union{Nothing,AbstractString}=nothing,
+    suffix=_now();
+    precompiles_filter=Returns(true),
+    maxsize::Integer=typemax(Int),
+    dedupe=true,
+    project=Base.active_project(),
+    cache_load_path=CACHE_PACKAGES_LOAD_PATH[]
 )
+    maxsize < 1 && ArgumentError("`maxsize` must be a positive integer")
     if isnothing(precompiles_path)
         trace_compile_ptr = Base.JLOptions().trace_compile
         trace_compile_ptr == C_NULL && ArgumentError("No `precompiles_path` provided and `--trace-compile` is not set")
@@ -42,30 +60,47 @@ function make_pkgimage_cache(
 
     isdir(cache_load_path) || error("Cache directory `$cache_load_path` does not exist")
     isfile(precompiles_path) || error("Precompiles file cannot be found at path `$precompiles_path`")
-    !isdir(joinpath(cache_load_path, cache_pkg_name)) || error("Cache with suffix `$suffix` already exists at `$(joinpath(cache_load_path, cache_pkg_name))`")
 
-    precompiles = Set(eachline(precompiles_path)) # TODO: preserve order
+    current_cache_paths = readdir(cache_load_path, join=true)
+    cache_path = joinpath(cache_load_path, cache_pkg_name)
+    any(startswith(cache_path), current_cache_paths) && error("Cache with suffix `$suffix` already exists at `$(joinpath(cache_load_path, cache_pkg_name))`")
+
+    # TODO: Validate the precompile statements
+    precompiles_dict = Dict(
+        precompile => Int32(i)
+        for (i, precompile)
+        in enumerate(Iterators.map(strip, eachline(precompiles_path)))
+        if precompiles_filter(precompile)
+    )
 
     if dedupe
-        for other_cache_pkg_name in readdir(cache_load_path, join=true)
+        for other_cache_pkg_name in current_cache_paths
             isdir(other_cache_pkg_name) || continue
-            startswith(CACHE_PACKAGE_NAME_PREFIX, basename(other_cache_pkg_name)) || continue
+            startswith(basename(other_cache_pkg_name), CACHE_PACKAGE_NAME_PREFIX) || continue
             for other_precompile in eachline(joinpath(other_cache_pkg_name, "src", "precompiles.jl"))
-                delete!(precompiles, other_precompile)
+                delete!(precompiles_dict, strip(other_precompile))
             end
-            if isempty(precompiles)
+            if isempty(precompiles_dict)
                 @info "No new precompiles to add to cache at `$cache_load_path`, skipping cache package creation for suffix `$suffix`"
-                return
+                return Base.PkgId[]
             end
         end
     else
-        if isempty(precompiles)
+        if isempty(precompiles_dict)
             @info "No new precompiles to add to cache at `$cache_load_path`, skipping cache package creation for suffix `$suffix`"
-            return
+            return Base.PkgId[]
         end
     end
 
-    return generate_cache_pkg(cache_load_path, cache_pkg_name, project, precompiles)
+    precompiles = sort!(collect(keys(precompiles_dict)), by=k->precompiles_dict[k])
+    partitions = Iterators.partition(precompiles, maxsize)
+    npartitions = length(partitions)
+    pkgids = Vector{Base.PkgId}(undef, npartitions)
+    for (i, partition) in enumerate(partitions)
+        cache_pkg_name_partitioned = string(cache_pkg_name, "_", lpad(string(i), Int(ceil(log10(npartitions))), '0'))
+        pkgids[i] = generate_cache_pkg(cache_load_path, cache_pkg_name_partitioned, project, partition)
+    end
+    return pkgids
 end
 
 _parse_deps(io) = sort!(collect(Pkg.TOML.parse(io)["deps"]))
@@ -102,7 +137,7 @@ function generate_cache_pkg(cache_load_path, cache_pkg_name, project, precompile
                     esc(try
                         \$expr;
                     catch e;
-                        @debug("Precompilation failed for `\$(\$(string(expr)))`",
+                        @warn("Precompilation failed for `\$(\$(string(expr)))`",
                             exception=e,
                             _file=\"$(joinpath(cache_load_path, cache_pkg_name, "src", "precompiles.jl"))\",
                             _line=nothing,
@@ -145,40 +180,77 @@ function generate_cache_pkg(cache_load_path, cache_pkg_name, project, precompile
 end
 
 _parse_pkgid(io) = (toml = Pkg.TOML.parse(io); Base.PkgId(UUID(toml["uuid"]), toml["name"]))
-function load_all_caches(mod=Module(), cache_load_path=CACHE_PACKAGES_PATH[], project = Base.active_project())
+function precompile_all_caches(cache_load_path=CACHE_PACKAGES_LOAD_PATH[]; maxtasks=MAX_CONCURRENT_PRECOMPILES[])
     isdir(cache_load_path) || error("Cache directory `$cache_load_path` does not exist")
-    cache_load_path in LOAD_PATH || error("Cache directory `$cache_load_path` is not in LOAD_PATH")
+    maxtasks < 1 && ArgumentError("`maxtasks` must be a positive integer")
 
-    try
-        @sync for cache_pkg_path in readdir(cache_load_path, join=true)
-            _is_cache_pkg_path(cache_pkg_path) || continue
-            pkgid = open(_parse_pkgid, joinpath(cache_pkg_path, "Project.toml"))
-            !Base.isprecompiled(pkgid) && (Threads.@spawn Base.compilecache(pkgid))
-        end
-    catch ex
-        @warn "Parallel precompilation failed. Compilation will be attempted at load time, serially." exception=ex
+    cache_paths = list_all_caches(cache_load_path, join=true)
+    isempty(cache_paths) && return nothing # TODO: log
+
+    maxtasks = min(length(cache_paths), maxtasks)
+    queue = Channel{String}(Inf)
+    tasks = Task[]
+
+    for cache_pkg_path in cache_paths
+        put!(queue, cache_pkg_path)
     end
 
-    for cache_pkg_name in readdir(cache_load_path)
-        _is_cache_pkg_path(joinpath(cache_load_path, cache_pkg_name)) || continue
+    for _ in 1:maxtasks
+        t = Threads.@spawn begin
+            q = $queue
+            while !isempty(q)
+                cache_pkg_path = take!(q)
+                pkgid = open(_parse_pkgid, joinpath(cache_pkg_path, "Project.toml"))
+                if !Base.isprecompiled(pkgid)
+                    time = @timed Base.compilecache(pkgid)
+                    @info "Precompiled `$(pkgid)` in $(time.time) seconds"
+                end
+            end
+        end
+        push!(tasks, t)
+    end
+    try
+        foreach(wait, tasks)
+    catch ex
+        close(queue, ex)
+        @warn "Parallel precompilation failed. Compilation will be attempted at load time, serially." exception=ex
+    end
+    return nothing
+end
+
+
+function load_all_caches(
+    mod=Main, cache_load_path=CACHE_PACKAGES_LOAD_PATH[];
+    maxtasks=MAX_CONCURRENT_PRECOMPILES[]
+)
+    cache_load_path in LOAD_PATH || error("Cache directory `$cache_load_path` is not in LOAD_PATH")
+
+    precompile_all_caches(cache_load_path; maxtasks)
+
+    for cache_pkg_path in readdir(cache_load_path, join=true)
+        _is_cache_pkg_path(cache_pkg_path) || continue
         try
-            Base.require(mod, Symbol(cache_pkg_name))
+            Base.require(mod, Symbol(basename(cache_pkg_path)))
         catch ex
             # TODO: the source location could be improved
             bt = catch_backtrace()
-            @warn "Failed to load cache package `$(cache_pkg_name)`" exception=(ex,bt) _file=joinpath(cache_load_path, cache_pkg_name) _module=cache_pkg_name _line=1
+            @warn "Failed to load cache package `$(cache_pkg_path)`" exception=(ex,bt) _file=cache_pkg_path _module=cache_pkg_name _line=1
         end
     end
 end
 
-function drop_all_caches(cache_load_path=CACHE_PACKAGES_PATH[]; force=false)
+function drop_all_caches(cache_load_path=CACHE_PACKAGES_LOAD_PATH[]; force=false)
     isdir(cache_load_path) || error("Cache directory `$cache_load_path` does not exist")
+    version = string("v", VERSION.major, ".", VERSION.minor) # TODO: support multiple versions
     if !force
         any(f->isdir(f) && !startswith(CACHE_PACKAGE_NAME_PREFIX), readdir(cache_load_path)) &&
             error("Cache directory `$cache_load_path` contains non-cache packages, won't delete anything")
     end
-    for cache_pkg_path in readdir(cache_load_path, join=true)
+    for cache_pkg_name in readdir(cache_load_path)
+        cache_pkg_path = joinpath(cache_load_path, cache_pkg_name)
+        cache_compiled_path = joinpath(CACHE_PACKAGES_DEPOT_PATH[], "compiled", version, cache_pkg_name)
         isdir(cache_pkg_path) && rm(cache_pkg_path, recursive=true, force=true)
+        isdir(cache_compiled_path) && rm(cache_compiled_path, recursive=true, force=true)
     end
 end
 
