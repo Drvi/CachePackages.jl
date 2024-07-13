@@ -103,7 +103,12 @@ function make_pkgimage_cache(
     return pkgids
 end
 
-_parse_deps(io) = sort!(collect(Pkg.TOML.parse(io)["deps"]))
+function _parse_deps(io)
+    project = Pkg.TOML.parse(io)
+    deps = collect(project["deps"])
+    push!(deps, project["name"] => project["uuid"])
+    return sort!(deps)
+end
 function generate_cache_pkg(cache_load_path, cache_pkg_name, project, precompiles)
     deps = open(_parse_deps, project)
 
