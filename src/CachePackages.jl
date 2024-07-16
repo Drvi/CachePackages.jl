@@ -8,6 +8,8 @@ const MAX_CONCURRENT_PRECOMPILES = Ref{Int}()
 const CACHE_PACKAGES_LOAD_PATH_LOCK = ReentrantLock()
 const CACHE_PACKAGE_NAME_PREFIX = "Cache"
 
+include("unsafe_require.jl")
+
 function __init__()
     path = mkpath(joinpath(first(Base.DEPOT_PATH), "cache_packages"))
     set_cache_package_path_and_add_it_to_load_path!(path)
@@ -15,7 +17,8 @@ function __init__()
     MAX_CONCURRENT_PRECOMPILES[] = 1 #Threads.nthreads(:default)
 end
 
-export set_cache_package_path_and_add_it_to_load_path!, make_pkgimage_cache, precompile_all_caches, load_all_caches, drop_all_caches, list_all_caches
+export set_cache_package_path_and_add_it_to_load_path!, make_pkgimage_cache, precompile_all_caches,
+    load_all_caches, drop_all_caches, list_all_caches, unsafe_load_all_caches
 
 function set_cache_package_path_and_add_it_to_load_path!(path)
     @lock CACHE_PACKAGES_LOAD_PATH_LOCK begin
@@ -239,7 +242,27 @@ function load_all_caches(
         catch ex
             # TODO: the source location could be improved
             bt = catch_backtrace()
-            @warn "Failed to load cache package `$(cache_pkg_path)`" exception=(ex,bt) _file=cache_pkg_path _module=cache_pkg_name _line=1
+            @warn "Failed to load cache package `$(cache_pkg_path)`" exception=(ex,bt) _file=cache_pkg_path _module=basename(cache_pkg_name) _line=1
+        end
+    end
+end
+
+function unsafe_load_all_caches(
+    mod=Main, cache_load_path=CACHE_PACKAGES_LOAD_PATH[];
+    maxtasks=MAX_CONCURRENT_PRECOMPILES[]
+)
+    cache_load_path in LOAD_PATH || error("Cache directory `$cache_load_path` is not in LOAD_PATH")
+
+    precompile_all_caches(cache_load_path; maxtasks)
+
+    for cache_pkg_path in readdir(cache_load_path, join=true)
+        _is_cache_pkg_path(cache_pkg_path) || continue
+        try
+            unsafe_require(mod, Symbol(basename(cache_pkg_path)))
+        catch ex
+            # TODO: the source location could be improved
+            bt = catch_backtrace()
+            @warn "Failed to load cache package `$(cache_pkg_path)`" exception=(ex,bt) _file=cache_pkg_path _module=basename(cache_pkg_name) _line=1
         end
     end
 end
