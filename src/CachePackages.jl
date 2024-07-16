@@ -17,7 +17,8 @@ function __init__()
     MAX_CONCURRENT_PRECOMPILES[] = 1 #Threads.nthreads(:default)
 end
 
-export set_cache_package_path_and_add_it_to_load_path!, make_pkgimage_cache, precompile_all_caches, load_all_caches, drop_all_caches, list_all_caches
+export set_cache_package_path_and_add_it_to_load_path!, make_pkgimage_cache, precompile_all_caches,
+    load_all_caches, drop_all_caches, list_all_caches, unsafe_load_all_caches
 
 function set_cache_package_path_and_add_it_to_load_path!(path)
     @lock CACHE_PACKAGES_LOAD_PATH_LOCK begin
