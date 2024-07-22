@@ -110,10 +110,10 @@ function _parse_deps(io)
     project = Pkg.TOML.parse(io)
     deps = collect(project["deps"])
     push!(deps, project["name"] => project["uuid"])
-    return sort!(deps)
+    return project["name"], sort!(deps)
 end
 function generate_cache_pkg(cache_load_path, cache_pkg_name, project, precompiles)
-    deps = open(_parse_deps, project)
+    project, deps = open(_parse_deps, project)
 
     mkpath(joinpath(cache_load_path, cache_pkg_name, "src"))
     local uuid
@@ -124,15 +124,13 @@ function generate_cache_pkg(cache_load_path, cache_pkg_name, project, precompile
             println(io, "# You shouldn't need to edit these files manually")
             println(io)
             println(io, "# Loading the dependencies of the original project that generated the `precompiles.jl` file")
-            for dep in deps
-                println(io, "using ", first(dep))
-            end
+            println(io, "using ", project)
             println(io)
             println(io, """
             # Precompile statements might use types from transitive dependencies, this
             # block makes all of those available as constants
-            for (pkgid, mod) in Base.loaded_modules
-                if !(pkgid.name in ("Main", "Core", "Base", $(join((repr(first(dep)) for dep in deps), ", "))))
+            for mod in Base.loaded_modules_order
+                if !(nameof(mod) in (:Main, :Core, :Base, Symbol($(repr(project)))))
                     Base.eval(@__MODULE__, :(const \$(Symbol(mod)) = \$mod))
                 end
             end
